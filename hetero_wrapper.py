@@ -110,16 +110,20 @@ class CommunicationChannel:
         n_agents: int,
         msg_size: int = 8,
         comm_range: int = 3,
+        drop_prob: float = 0.0,
     ):
         """
         Args:
             n_agents: Number of robots in the environment.
             msg_size: Size of the placeholder message vector per robot.
             comm_range: Manhattan distance within which robots can communicate.
+            drop_prob: Probability that any single message is dropped (0.0 = perfect).
         """
         self.n_agents = n_agents
         self.msg_size = msg_size
         self.comm_range = comm_range
+        self.drop_prob = drop_prob
+        self._rng: np.random.Generator = np.random.default_rng()
 
         # Message buffer: each robot's outgoing message (all zeros = stub)
         self.messages: np.ndarray = np.zeros((n_agents, msg_size), dtype=np.float32)
@@ -179,14 +183,24 @@ class CommunicationChannel:
         """
         Receive messages from all in-range neighbors.
 
+        Each individual message is independently dropped with probability
+        ``drop_prob`` (default 0.0 = no drops).
+
         Returns:
-            np.ndarray of shape (len(neighbors), msg_size).
-            Empty (0, msg_size) array if no neighbors in range.
+            np.ndarray of shape (n_received, msg_size).
+            Empty (0, msg_size) array if no neighbors in range or all dropped.
         """
         neighbors = self.get_neighbors(agent_idx)
         if not neighbors:
             return np.zeros((0, self.msg_size), dtype=np.float32)
-        return self.messages[neighbors].copy()
+        received = []
+        for j in neighbors:
+            if self._rng.random() < self.drop_prob:
+                continue  # message dropped
+            received.append(self.messages[j].copy())
+        if not received:
+            return np.zeros((0, self.msg_size), dtype=np.float32)
+        return np.array(received, dtype=np.float32)
 
     def step(self) -> None:
         """
@@ -239,6 +253,7 @@ class HeterogeneousWarehouse(gym.Wrapper):
         mismatch_penalty: float = DEFAULT_MISMATCH_PENALTY,
         comm_msg_size: int = 8,
         comm_range: int = 3,
+        comm_drop_prob: float = 0.0,
     ):
         super().__init__(env)
 
@@ -263,6 +278,7 @@ class HeterogeneousWarehouse(gym.Wrapper):
             n_agents=self.n_agents,
             msg_size=comm_msg_size,
             comm_range=comm_range,
+            drop_prob=comm_drop_prob,
         )
 
         # ── Internal RNG (separate from base env) ───────────────────────
@@ -286,6 +302,14 @@ class HeterogeneousWarehouse(gym.Wrapper):
 
         # Store base dim for slicing
         self._base_obs_dim = base_dim
+
+        # ── Action space: extend to include auxiliary outputs ────────────
+        # Each agent outputs a MultiDiscrete: [5 movement actions, 2 comm gate actions]
+        # (The bid value is a continuous output, not handled in the gym action space,
+        #  but by the custom PPO training loop directly).
+        self.action_space = gym.spaces.Tuple(
+            tuple([gym.spaces.MultiDiscrete([5, 2])] * self.n_agents)
+        )
 
     # ═══════════════════════════════════════════════════════════════════════
     # Reset
@@ -330,43 +354,68 @@ class HeterogeneousWarehouse(gym.Wrapper):
         Execute one step with heterogeneous modifications.
 
         Order of operations:
-          1. Force NOOP for dead-battery agents
-          2. Apply heavy_load skip (pre-step)
-          3. Snapshot request queue (for delivery detection)
-          4. Call base env.step()
-          5. Detect deliveries and apply mismatch penalty
-          6. Apply fast_light bonus move (post-step)
-          7. Update battery
-          8. Assign task types to any new requests
-          9. Run communication stub
-          10. Build extended observations
+          1. Parse actions (handle both Discrete and MultiDiscrete formats)
+          2. Force NOOP for dead-battery agents
+          3. Apply heavy_load skip (pre-step)
+          4. Snapshot request queue and positions
+          5. Call base env.step()
+          6. Apply collision and comm-cost penalties
+          7. Detect deliveries and apply mismatch penalty
+          8. Apply fast_light bonus move (post-step)
+          9. Update battery
+          10. Assign task types to any new requests
+          11. Run communication stub
+          12. Build extended observations
         """
-        actions = list(actions)  # make mutable copy
+        # 1. Parse actions
+        move_actions = []
+        comm_gates = []
+        for a in actions:
+            if isinstance(a, (list, tuple, np.ndarray)) and len(a) >= 2:
+                move_actions.append(int(a[0]))
+                comm_gates.append(int(a[1]))
+            else:
+                move_actions.append(int(a))
+                comm_gates.append(0)  # default no comm
 
-        # 1. Force NOOP for dead-battery agents
-        actions = self._enforce_battery_constraint(actions)
+        # 2. Force NOOP for dead-battery agents
+        move_actions = self._enforce_battery_constraint(move_actions)
 
-        # 2. Apply heavy_load move skip (before base env sees the action)
-        actions, bonus_agents = self._apply_speed_effects(actions)
+        # 3. Apply heavy_load move skip (before base env sees the action)
+        move_actions, bonus_agents = self._apply_speed_effects(move_actions)
 
-        # 3. Snapshot the request queue before step (for delivery detection)
+        # 4. Snapshot the request queue and positions before step
         old_queue_ids = set(s.id for s in self.base_env.request_queue)
+        old_positions = [(agent.x, agent.y) for agent in self.base_env.agents]
 
-        # 4. Base environment step
-        base_obs, rewards, done, truncated, info = self.env.step(actions)
+        # 5. Base environment step
+        base_obs, rewards, done, truncated, info = self.env.step(move_actions)
         rewards = np.array(rewards, dtype=np.float64)
 
-        # 5. Detect deliveries and apply mismatch penalty
+        # 6. Apply collision and comm-cost penalties
+        new_positions = [(agent.x, agent.y) for agent in self.base_env.agents]
+        for i in range(self.n_agents):
+            # Collision penalty: requested FORWARD but position unchanged
+            if move_actions[i] == 1 and old_positions[i] == new_positions[i]:
+                rewards[i] -= 0.1
+            
+            # Comm-cost penalty
+            if comm_gates[i] == 1:
+                rewards[i] -= 0.01
+            
+            # TODO(Phase 6): add fault recovery bonus
+
+        # 7. Detect deliveries and apply mismatch penalty
         new_queue_ids = set(s.id for s in self.base_env.request_queue)
         rewards = self._apply_mismatch_penalty(rewards, old_queue_ids, new_queue_ids)
 
-        # 6. Apply fast_light bonus move (extra step for eligible agents)
+        # 8. Apply fast_light bonus move (extra step for eligible agents)
         if bonus_agents and not done:
             base_obs, rewards, done, truncated, info = self._apply_bonus_moves(
                 bonus_agents, base_obs, rewards, done, truncated, info
             )
 
-        # 7. Update battery
+        # 9. Update battery
         self._update_battery()
 
         # 8. Assign task types to any newly added requests
